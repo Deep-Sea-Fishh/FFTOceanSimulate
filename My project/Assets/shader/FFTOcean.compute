@@ -1,0 +1,300 @@
+#pragma kernel ComputeGaussianRandom
+#pragma kernel ComputeHeight
+#pragma kernel ComputeDisplaceXZ
+#pragma kernel FFT_1_Init
+#pragma kernel FFT_1
+#pragma kernel FFT_2_Init
+#pragma kernel FFT_2
+#pragma kernel TextureGenerationDisplace
+#pragma kernel TextureGenerationNormalBubbles
+
+
+//预定义
+#define PI 3.1415926536
+#define G 9.81
+
+//变量
+uint rngState;      //随机数
+int fftPower;       //2的次幂
+float OceanLength;
+int N;              //大小
+float A;            //phillips参数，调整波峰高度
+float4 wind;        //风向,长度是风速
+float Time;         //时间
+int SN;             //fft时块的大小
+float HeightScale;  //高度缩放系数
+float AlphaScale;   //xz偏移缩放系数
+float BubblesThreshold;
+float BubblesScale;
+
+//材质
+RWTexture2D<float4> GaussianRandomRT;
+RWTexture2D<float4> DisplaceYRT;
+RWTexture2D<float4> DisplaceXRT;
+RWTexture2D<float4> DisplaceZRT;
+RWTexture2D<float4> DisplaceRT;
+RWTexture2D<float4> NormalRT;
+RWTexture2D<float4> BubblesRT;
+RWTexture2D<float4> InputRT;
+RWTexture2D<float4> OutputRT;
+
+//函数
+float2 gaussian(float2 id);
+
+
+[numthreads(8,8,1)]
+void ComputeGaussianRandom(uint3 id : SV_DispatchThreadID)
+{
+    float2 g = gaussian(id.xy);
+    GaussianRandomRT[id.xy] = float4(g, 0, 0);
+}
+//计算弥散
+float dispersion(float2 k)
+{
+    return sqrt(G * length(k));
+}
+//Donelan-Banner方向拓展
+float DonelanBannerDirectionalSpreading(float2 k)
+{
+    float betaS;
+    float omegap = 0.855f * G / length(wind.xy);
+    float ratio = dispersion(k) / omegap;
+
+    if (ratio < 0.95f)
+    {
+        betaS = 2.61f * pow(ratio, 1.3f);
+    }
+    if (ratio >= 0.95f && ratio < 1.6f)
+    {
+        betaS = 2.28f * pow(ratio, -1.3f);
+    }
+    if (ratio > 1.6f)
+    {
+        float epsilon = -0.4f + 0.8393f * exp(-0.567f * log(ratio * ratio));
+        betaS = pow(10, epsilon);
+    }
+    float theta = atan2(k.y, k.x) - atan2(wind.y, wind.x);
+
+    return betaS / max(1e-7f, 2.0f * tanh(betaS * PI) * pow(cosh(betaS * theta), 2));
+}
+
+//phillips频谱
+float ComputePhillips(float2 k)
+{
+    float V = length(wind.xy);
+    float2 w = float2(wind.xy);
+    float L = V * V / G;
+    float klength = length(k);
+    klength = max(0.001f, klength);
+    float k2 = klength * klength;
+    float k4 = k2 * k2;
+    float l2 = L * L;
+    float damping = 0.001f;
+    float L2 = l2 *damping * damping;
+    float k_dot_w = k.x * w.x + k.y * w.y;
+    //float kw2 = k_dot_w * k_dot_w;
+    float kw2 = DonelanBannerDirectionalSpreading(k);
+    return A * exp(-1.0f / (k2 * l2)) / k4 * kw2;
+}
+
+//计算H0
+float ComputeH0(float2 k)
+{
+    float ph = sqrt(ComputePhillips(k) * 0.5f);
+    return ph;
+}
+
+float2 ComplexMul(float2 c1, float2 c2)
+{
+    return float2(c1.x * c2.x - c1.y * c2.y, c1.x * c2.y + c1.y * c2.x);
+}
+//计算高度频谱
+[numthreads(8, 8, 1)]
+void ComputeHeight(uint3 id : SV_DispatchThreadID)
+{
+    float2 k = float2(2.0f * PI * id.x / N - PI, 2.0f * PI * id.y / N - PI);
+    float2 g = GaussianRandomRT[id.xy].xy;
+    float2 h0 = g * ComputeH0(k);
+    float2 _h0 = g * ComputeH0(-k);
+    _h0.y = -_h0.y;
+    float a = sqrt(G * length(k)) * Time;
+    float c = cos(a), s = sin(a);
+    float2 h1 = ComplexMul(h0 , float2(c , s)), h2 = ComplexMul(_h0 , float2(c, -s));
+    if (id.x & 1)DisplaceYRT[id.xy] = -float4(h1 + h2, 0, 0);
+    else DisplaceYRT[id.xy] = float4(h1 + h2, 0, 0);
+}
+
+[numthreads(8, 8, 1)]
+void ComputeDisplaceXZ(uint3 id : SV_DispatchThreadID)
+{
+    float2 k = float2(2 * PI * id.x / N - PI, 2 * PI * id.y / N - PI);
+    float klength = length(k);
+    klength = max(klength, 0.0001f);
+    k /= klength;
+    float2 w1 = float2(0, -k.x );
+    float2 w2 = float2(0, -k.y );
+    DisplaceXRT[id.xy] = float4(ComplexMul(w1, DisplaceYRT[id.xy].xy), 0, 0);
+    DisplaceZRT[id.xy] = float4(ComplexMul(w2, DisplaceYRT[id.xy].xy), 0, 0);
+}
+
+
+int getBitReverse(int x)
+{
+    int res = 0;
+    for (int i = 0; i < fftPower; i++)
+    {
+        res += (1 << (fftPower - i - 1)) * ((x >> i) & 1);
+    }
+    return res;
+}
+
+//横向FFT初始化
+[numthreads(8, 8, 1)]
+void FFT_1_Init(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x;
+    int2 k = int2(getBitReverse(x), id.y);
+    OutputRT[k] = InputRT[id.xy];
+}
+//横向FFT
+[numthreads(8, 8, 1)]
+void FFT_1(uint3 id : SV_DispatchThreadID)
+{
+    int halfSN = SN >> 1;
+    int x = id.x % SN;
+    //计算W(SN,-x)
+    float a = 2.0f * PI * x / SN;
+    float C = cos(a), S = sin(a);
+    float2 W = float2(C, S);
+    float2 res;
+    int2 k1, k2;
+    if (x < halfSN)
+        k1 = id.xy, k2 = int2(id.x + halfSN, id.y);
+    else
+        k1 = int2(id.x - halfSN, id.y), k2 = id.xy;
+    res = InputRT[k1].xy + ComplexMul(W, InputRT[k2].xy);
+    if (SN == N)OutputRT[id.xy] = float4(res, 0, 0) * ((id.x + id.y - (N >> 1)) & 1 ? -1.0f : 1.0f);
+    else OutputRT[id.xy] = float4(res, 0, 0);
+}
+
+
+//纵FFT初始化
+[numthreads(8, 8, 1)]
+void FFT_2_Init(uint3 id : SV_DispatchThreadID)
+{
+    int y = id.y;
+    int2 k = int2(id.x, getBitReverse(y));
+    OutputRT[k] = InputRT[id.xy];
+//    OutputRT[id.xy] = InputRT[int2(id.x, 2)];
+}
+//纵向FFT
+[numthreads(8, 8, 1)]
+void FFT_2(uint3 id : SV_DispatchThreadID)
+{
+    int halfSN = (SN >> 1);
+    int y = id.y % SN;
+    //计算W(SN,-y)
+    float a = 2.0f * PI * y / SN;
+    float C = cos(a), S = sin(a);
+    float2 W = float2(C, S);
+    float2 res;
+    int2 k1, k2;
+    if (y < halfSN)
+        k1 = id.xy, k2 = int2( id.x, id.y + halfSN);
+    else
+        k1 = int2(id.x, id.y - halfSN), k2 = id.xy;
+    float2 t1 = InputRT[k1].xy;
+    float2 t2 = ComplexMul(W, InputRT[k2].xy);
+    res = t1 + t2;
+
+    if (SN == N)OutputRT[id.xy] = float4(res, 0, 0) * ((id.y - (N >> 1)) & 1 ? -1.0f : 1.0f);
+    else OutputRT[id.xy] = float4(res, 0, 0);
+}
+
+[numthreads(8, 8, 1)]
+void TextureGenerationDisplace(uint3 id: SV_DispatchThreadID)
+{
+    float y = length(DisplaceYRT[id.xy].xy) / (N * N) * HeightScale;//高度
+    float x = length(DisplaceXRT[id.xy].xy) / (N * N) * AlphaScale;//X
+    float z = length(DisplaceZRT[id.xy].xy) / (N * N) * AlphaScale;//Z
+    DisplaceYRT[id.xy] = float4(y, y, y, 0);
+    DisplaceXRT[id.xy] = float4(x, x, x, 0);
+    DisplaceZRT[id.xy] = float4(z, z, z, 0);
+    DisplaceRT[id.xy] = float4(x, y, z, 0);
+}
+//生成法线和泡沫纹理
+[numthreads(8, 8, 1)]
+void TextureGenerationNormalBubbles(uint3 id: SV_DispatchThreadID)
+{
+    //计算法线
+    float uLength = OceanLength / (N - 1.0f);
+    //获取当前点，周围4个点的uv坐标
+    uint2 uvX1 = uint2((id.x - 1.0f + N) % N, id.y);
+    uint2 uvX2 = uint2((id.x + 1.0f + N) % N, id.y);
+    uint2 uvZ1 = uint2(id.x, (id.y - 1.0f + N) % N);
+    uint2 uvZ2 = uint2(id.x, (id.y + 1.0f + N) % N);
+
+    //以当前点为中心，获取周围4个点的偏移值
+    float3 x1D = DisplaceRT[uvX1].xyz;
+    float3 x2D = DisplaceRT[uvX2].xyz;
+    float3 z1D = DisplaceRT[uvZ1].xyz;
+    float3 z2D = DisplaceRT[uvZ2].xyz;
+    
+    //以当前点为原点，构建周围4个点的坐标
+    float3 x1 = float3(x1D.x - uLength, x1D.yz);
+    float3 x2 = float3(x2D.x + uLength, x2D.yz);
+    float3 z1 = float3(z1D.xy, z1D.z - uLength);
+    float3 z2 = float3(z1D.xy, z1D.z + uLength);
+
+    //计算两个切向量
+    float3 tangentX = x2 - x1;
+    float3 tangentZ = z2 - z1;
+
+    //计算法线
+    float3 normal = normalize(cross(tangentZ, tangentX));
+    NormalRT[id.xy] = float4(normal, 0);
+
+    //计算泡沫
+    float3 ddx = x2D - x1D;
+    float3 ddz = z2D - z1D;
+    //雅可比行列式
+    float jacobian = (1.0f + ddx.x) * (1.0f + ddz.z) - ddx.z * ddz.x;
+    jacobian = saturate(max(0, BubblesThreshold - saturate(jacobian)) * BubblesScale);
+    
+    BubblesRT[id.xy] = float4(jacobian, jacobian, jacobian, 0);
+}
+//wangHash
+uint wangHash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+//获取[0,1]的均匀分布函数
+float rand()
+{
+    rngState ^= rngState << 13;
+    rngState ^= rngState >> 17;
+    rngState ^= rngState << 5;
+    return rngState / 4294967296.0f;
+}
+
+
+float2 gaussian(float2 id)
+{
+    //均匀分布随机数
+    rngState = wangHash(id.y * N + id.x);
+    float x1 = rand();
+    float x2 = rand();
+
+    x1 = max(1e-6f, x1);
+    x2 = max(1e-6f, x2);
+    //计算两个相互独立的高斯随机数
+    float g1 = sqrt(-2.0f * log(x1)) * cos(2.0f * PI * x2);
+    float g2 = sqrt(-2.0f * log(x1)) * sin(2.0f * PI * x2);
+
+    return float2(g1, g2);
+}
